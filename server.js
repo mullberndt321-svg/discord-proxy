@@ -6,6 +6,7 @@
  *   /_cdn/...         -> cdn.discordapp.com
  *   /_media/...       -> media.discordapp.net
  *   /_gw (WebSocket)  -> gateway.discord.gg
+ *   /_ra (WebSocket)  -> remote-auth-gateway.discord.gg (QR-Login)
  *   alles andere      -> discord.com
  *
  * Start:  node server.js      (PORT=8080 ist Standard)
@@ -34,20 +35,29 @@ function resolveUpstream(url) {
   return { host: "discord.com", path: url };
 }
 
-// Ersetzt Discord-URLs in Antworten durch die Adresse dieses Proxys
+const HOST_MAP = {
+  "remote-auth-gateway.discord.gg": "/_ra",
+  "gateway.discord.gg": "/_gw",
+  "cdn.discordapp.com": "/_cdn",
+  "media.discordapp.net": "/_media",
+  "discord.com": "",
+};
+const HOST_RE = /(?:wss:\/\/|https:\/\/|\/\/)(?:remote-auth-gateway\.discord\.gg|gateway\.discord\.gg|cdn\.discordapp\.com|media\.discordapp\.net|discord\.com)/g;
+
+// Ersetzt Discord-URLs in Antworten durch die Adresse dieses Proxys (ein Durchlauf)
 function rewrite(text, host, secure) {
   const http_ = secure ? "https" : "http";
   const ws = secure ? "wss" : "ws";
-  return text
-    .replace(/wss:\/\/gateway\.discord\.gg/g, `${ws}://${host}/_gw`)
-    .replace(/https:\/\/cdn\.discordapp\.com/g, `${http_}://${host}/_cdn`)
-    .replace(/https:\/\/media\.discordapp\.net/g, `${http_}://${host}/_media`)
-    .replace(/\/\/cdn\.discordapp\.com/g, `//${host}/_cdn`)
-    .replace(/\/\/media\.discordapp\.net/g, `//${host}/_media`)
-    .replace(/\/\/gateway\.discord\.gg/g, `//${host}/_gw`)
-    .replace(/https:\/\/discord\.com/g, `${http_}://${host}`)
-    .replace(/\/\/discord\.com/g, `//${host}`);
+  return text.replace(HOST_RE, (m) => {
+    const scheme = m.startsWith("wss://") ? ws + "://" : m.startsWith("https://") ? http_ + "://" : "//";
+    const target = m.replace(/^(?:wss:\/\/|https:\/\/|\/\/)/, "");
+    return scheme + host + HOST_MAP[target];
+  });
 }
+
+// Zwischenspeicher für umgeschriebene /assets/-Dateien (spart CPU auf dem Gratis-Tarif)
+const CACHE = new Map();
+let cacheSize = 0;
 
 const REWRITABLE = /(text\/html|javascript|text\/css|application\/json|manifest)/i;
 
@@ -69,6 +79,12 @@ const server = http.createServer((req, res) => {
   const myHost = req.headers.host;
   const secure = (req.headers["x-forwarded-proto"] || "http") === "https";
   const up = resolveUpstream(req.url);
+  const cacheKey = req.method === "GET" && up.host === "discord.com" && up.path.startsWith("/assets/") ? up.path : null;
+  const hit = cacheKey && CACHE.get(cacheKey);
+  if (hit) {
+    res.writeHead(200, hit.headers);
+    return res.end(hit.body);
+  }
 
   const headers = { ...req.headers, host: up.host, "accept-encoding": "identity" };
   headers.origin = "https://discord.com";
@@ -110,6 +126,10 @@ const server = http.createServer((req, res) => {
           const body = Buffer.from(rewrite(raw.toString("utf8"), myHost, secure));
           delete out["content-encoding"];
           out["content-length"] = body.length;
+          if (cacheKey && upRes.statusCode === 200 && cacheSize + body.length < 80e6) {
+            CACHE.set(cacheKey, { headers: { ...out }, body });
+            cacheSize += body.length;
+          }
           res.writeHead(upRes.statusCode, out);
           res.end(body);
         } catch (err) {
@@ -132,14 +152,19 @@ const server = http.createServer((req, res) => {
 
 // WebSocket-Tunnel zum Discord-Gateway
 server.on("upgrade", (req, socket, head) => {
-  if (!req.url.startsWith("/_gw")) return socket.destroy();
+  const route = req.url.startsWith("/_ra")
+    ? { p: "/_ra", h: "remote-auth-gateway.discord.gg" }
+    : req.url.startsWith("/_gw")
+    ? { p: "/_gw", h: "gateway.discord.gg" }
+    : null;
+  if (!route) return socket.destroy();
 
   const upReq = https.request({
-    hostname: "gateway.discord.gg",
+    hostname: route.h,
     port: 443,
-    path: req.url.slice("/_gw".length) || "/",
+    path: req.url.slice(route.p.length) || "/",
     method: "GET",
-    headers: { ...req.headers, host: "gateway.discord.gg", origin: "https://discord.com" },
+    headers: { ...req.headers, host: route.h, origin: "https://discord.com" },
   });
 
   upReq.on("upgrade", (upRes, upSocket, upHead) => {
